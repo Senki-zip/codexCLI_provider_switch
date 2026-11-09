@@ -1,0 +1,14 @@
+codexCLI_provider_switch
+Copyright (c) 2026 Senki-zip
+
+Provider switching workflow concepts were informed by reviewing CC Switch CLI
+(https://github.com/SaladDay/cc-switch-cli) and CC Switch
+(https://github.com/farion1231/cc-switch). Neither is a runtime dependency.
+This distribution does not include the cc-switch source tree or claim affiliation.
+No cc-switch implementation code is knowingly included in these two Python tools.
+If future contributions copy upstream implementation code, retain its original
+copyright and MIT license attribution alongside the copied material.
+
+The two root scripts were supplied from the author's local implementation for
+this authorized release; local credentials, history, experimental trials and
+real-world repair reports are not part of this distribution.

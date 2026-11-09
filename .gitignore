@@ -1,0 +1,34 @@
+# Credentials, local configuration, history and sensitive diagnostics
+auth.json
+*auth*.json
+.env
+.env.*
+config.toml
+*.sqlite*
+*.db
+*.db-*
+*.log
+*.jsonl
+*.json
+*.enc
+*.pem
+*.key
+sessions/
+archived_sessions/
+logs/
+reports/
+trials/
+repair-backups/
+.switch-backups/
+.codex/
+# Development artifacts
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage*
+htmlcov/
+test-artifacts/
+*.tmp
+*.stderr

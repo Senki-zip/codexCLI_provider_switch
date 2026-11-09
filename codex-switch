@@ -1,0 +1,422 @@
+#!/usr/bin/env python3
+"""codex-switch — switch Codex CLI between the official OpenAI channel and Krillcode.
+
+Channels
+  official   model_provider defaults to openai (ChatGPT login in ~/.codex/auth.json)
+  krillcode  custom provider pointing at the Krillcode relay, key pulled at runtime
+             from ~/.local/share/opencode/auth.json (never written to disk)
+
+History repair delegates to codex_session_repair.py for structured cleanup,
+precise provider migration and native projection rebuilding. Cleanup removes
+incompatible encrypted reasoning; it does not convert ciphertext.
+
+Usage
+  codex-switch status
+  codex-switch official  [--model M] [--no-retag] [--force] [--dry-run] [--test]
+  codex-switch krillcode [--model M] [--url URL] [--no-retag] [--force] [--dry-run] [--test]
+  codex-switch retag     [--force] [--dry-run]
+  codex-switch repair-index [--dry-run]
+  codex-switch repair-session ID [--provider PROVIDER] [--dry-run]
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import fcntl
+import json
+import importlib.util
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import tomllib
+from pathlib import Path
+
+CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+CONFIG = CODEX_HOME / "config.toml"
+STATE_DB = CODEX_HOME / "state_5.sqlite"
+SESSIONS = CODEX_HOME / "sessions"
+LOCKS = CODEX_HOME / "thread-writer-locks"
+OPENCODE_AUTH = Path(os.environ.get(
+    "CODEX_SWITCH_OPENCODE_AUTH",
+    str(Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
+        / "opencode/auth.json"))).expanduser().resolve()
+NODE = os.environ.get("CODEX_SWITCH_NODE") or shutil.which("node")
+
+KRILL_URL = "https://api.kbsfdxc.net/backend-api/codex"
+KRILL_MODELS = ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "codex-auto-review"]
+OFFICIAL_MODEL = "gpt-6.1-sol"
+KRILL_MODEL = "gpt-6.1-sol"
+REASONING = "medium"
+
+PROVIDER_ID = {"official": "openai", "krillcode": "krillcode"}
+ALL_PROVIDERS = ("openai", "krillcode")
+
+REPAIR_HELPER = Path(__file__).resolve().with_name("codex_session_repair.py")
+
+KRILL_FEATURES = {"fast_mode": "true", "context_management": "true"}
+
+AUTH_ARGS = [
+    "-e",
+    "const fs=require('fs');"
+    "const a=JSON.parse(fs.readFileSync(process.argv[1],'utf8'));"
+    "const k=a.krillcode?.key;"
+    "if(typeof k!=='string'||!k.trim())throw new Error('Krillcode API key is missing in OpenCode');"
+    "process.stdout.write(k.trim());",
+    str(OPENCODE_AUTH),
+]
+
+
+# ---------------------------------------------------------------- config model
+def split_config(text: str):
+    """Split into (preamble_lines, [(header, [lines]), ...]) keeping original order."""
+    preamble: list[str] = []
+    sections: list[tuple[str, list[str]]] = []
+    cur: list[str] | None = None
+    for line in text.splitlines():
+        m = re.match(r"^\s*\[\[?([^\]]+)\]\]?\s*(?:#.*)?$", line)
+        if m:
+            cur = [line]
+            sections.append((m.group(1).strip(), cur))
+        elif cur is None:
+            preamble.append(line)
+        else:
+            cur.append(line)
+    return preamble, sections
+
+
+def parse_preamble(lines: list[str]):
+    """Return (ordered key->raw line, free lines) for top-level scalar keys."""
+    keys: list[tuple[str, str]] = []
+    free: list[str] = []
+    for line in lines:
+        m = re.match(r"^\s*([A-Za-z0-9_.\-]+)\s*=", line)
+        if m:
+            keys.append((m.group(1), line))
+        elif line.strip():
+            free.append(line)
+    return keys, free
+
+
+def parse_flat_section(lines: list[str]) -> list[tuple[str, str]]:
+    out = []
+    for line in lines[1:]:
+        m = re.match(r"^\s*([A-Za-z0-9_.\-]+)\s*=\s*(.+?)\s*$", line)
+        if m:
+            out.append((m.group(1), m.group(2)))
+    return out
+
+
+def read_key(path: Path, provider: str) -> str:
+    try:
+        data = json.loads(path.read_text())
+    except Exception:
+        return ""
+    entry = data.get(provider) or {}
+    key = entry.get("key") if isinstance(entry, dict) else ""
+    return key.strip() if isinstance(key, str) else ""
+
+
+def build_config(mode: str, model: str, url: str, text: str) -> str:
+    """Overlay channel-owned scalars, preserving unrelated TOML verbatim."""
+    if not NODE:
+        raise ValueError('Node.js unavailable; set CODEX_SWITCH_NODE or install node on PATH')
+    original = tomllib.loads(text)
+    preamble, sections = split_config(text)
+
+    def overlay(lines, updates):
+        result, pending = [], dict(updates)
+        for line in lines:
+            match = re.match(r'^\s*([A-Za-z0-9_.-]+)\s*=', line)
+            key = match.group(1) if match else None
+            if key in updates:
+                value = pending.pop(key, None)
+                if value is not None:
+                    result.append(f'{key} = {value}')
+            else:
+                result.append(line)
+        result.extend(f'{k} = {v}' for k, v in pending.items() if v is not None)
+        return result
+
+    updates = dict(model=json.dumps(model), model_provider=json.dumps(PROVIDER_ID[mode]),
+                   model_reasoning_effort=json.dumps(REASONING),
+                   openai_base_url=None, chatgpt_base_url=None)
+    # OpenAI remains a native built-in (do not override its OAuth routing).
+    # Keep/register Krillcode even in official mode for skipped DB-only history.
+    krill_url = url or (original.get('model_providers', {}).get('krillcode') or {}).get('base_url') or KRILL_URL
+    edits = {
+        'model_providers.krillcode': dict(name='"Krillcode"', base_url=json.dumps(krill_url),
+            wire_api='"responses"', supports_websockets='false'),
+        'model_providers.krillcode.auth': dict(command=json.dumps(NODE), args=json.dumps(AUTH_ARGS)),
+    }
+    if mode == 'krillcode':
+        updates.update(web_search='"live"', suppress_unstable_features_warning='true')
+    out = overlay(preamble, updates)
+    for name, lines in sections:
+        changes = edits.pop(name, None)
+        if name == 'features' and mode == 'krillcode':
+            changes = {k: v for k, v in KRILL_FEATURES.items()
+                       if k not in original.get('features', {})}
+        out.extend(['', lines[0]])
+        out.extend(overlay(lines[1:], changes) if changes is not None else lines[1:])
+    if mode == 'krillcode' and not any(n == 'features' for n, _ in sections):
+        edits['features'] = {k: v for k, v in KRILL_FEATURES.items()
+                             if k not in original.get('features', {})}
+    for name, values in edits.items():
+        if values:
+            out.extend(['', f'[{name}]'])
+            out.extend(f'{key} = {value}' for key, value in values.items())
+    result = '\n'.join(out).rstrip() + '\n'
+    parsed = tomllib.loads(result)
+    # Line-preserving edits deliberately support ordinary table syntax only.
+    # Never silently alter multiline strings, quoted keys, or unknown data.
+    allowed = [(key,) for key in updates]
+    allowed += [('model_providers', 'krillcode', key) for key in
+                ('name', 'base_url', 'wire_api', 'supports_websockets')]
+    allowed += [('model_providers', 'krillcode', 'auth', key)
+                for key in ('command', 'args')]
+    if mode == 'krillcode':
+        allowed += [('features', key) for key in KRILL_FEATURES
+                    if key not in original.get('features', {})]
+
+    def unmanaged(data):
+        data = copy.deepcopy(data)
+        for path in allowed:
+            node = data
+            for key in path[:-1]:
+                node = node.get(key, {}) if isinstance(node, dict) else {}
+            if isinstance(node, dict):
+                node.pop(path[-1], None)
+
+        def prune(value):
+            if isinstance(value, dict):
+                return {k: prune(v) for k, v in value.items() if v != {}}
+            return value
+
+        # Prune empty parent tables left by removing managed fields.
+        for _ in range(4):
+            data = prune(data)
+        return data
+
+    if unmanaged(original) != unmanaged(parsed):
+        raise ValueError('config edit would change unrelated TOML; config unchanged')
+    return result
+
+
+def write_config(text: str) -> None:
+    fd, name = tempfile.mkstemp(prefix='.config-switch-', dir=CODEX_HOME)
+    tmp = Path(name)
+    try:
+        with os.fdopen(fd, 'w') as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, CONFIG)
+    finally:
+        tmp.unlink(missing_ok=True)
+    print(f'   config written  {CONFIG}')
+
+
+def backup_home() -> Path:
+    root = CODEX_HOME / '.switch-backups'
+    root.mkdir(mode=0o700, exist_ok=True)
+    backup = Path(tempfile.mkdtemp(prefix='repair-', dir=root))
+    print(f'   backup retained {backup}', flush=True)
+    # The repair helper backs up affected rollouts and SQLite via backup API.
+    # Do not recursively copy old backups/packages on every channel switch.
+    snapshot = backup / 'home'
+    snapshot.mkdir(mode=0o700)
+    if CONFIG.exists():
+        shutil.copy2(CONFIG, snapshot / 'config.toml')
+        (snapshot / 'config.toml').chmod(0o600)
+    return backup
+
+
+# ------------------------------------------------------------- history retag
+def active_writers() -> list[str]:
+    busy = []
+    if not LOCKS.is_dir():
+        return busy
+    for lock in LOCKS.glob("*.lock"):
+        try:
+            with open(lock, "r") as fh:
+                try:
+                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(fh, fcntl.LOCK_UN)
+                except BlockingIOError:
+                    busy.append(lock.stem)
+        except OSError as exc:
+            raise RuntimeError(f"cannot inspect writer lock {lock.name}") from exc
+    return busy
+
+
+def require_idle() -> None:
+    busy = active_writers()
+    if busy:
+        raise RuntimeError(f'{len(busy)} active session writer(s); close all Codex sessions. '
+                           '--force cannot bypass this check; config unchanged.')
+
+
+def _load_repair_helper():
+    spec = importlib.util.spec_from_file_location('codex_safe_repair', REPAIR_HELPER)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def repair_sessions(target: str, dry: bool, session_id: str | None = None, commit_callback=None) -> None:
+    if target not in ALL_PROVIDERS:
+        raise ValueError('unsupported provider')
+    require_idle()
+    if not REPAIR_HELPER.is_file():
+        raise RuntimeError(f'safe repair helper unavailable: {REPAIR_HELPER}')
+    if not dry:
+        backup_home()
+    helper = _load_repair_helper()
+    if session_id:
+        result = helper.repair_session(CODEX_HOME, session_id, target, dry)
+    else:
+        reuse = os.environ.get('CODEX_REPAIR_REUSE_BATCH')
+        result = helper.repair_all(CODEX_HOME, target, dry, commit_callback=commit_callback,
+                                   **({'reuse_batch': reuse} if reuse else {}))
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    require_idle()
+
+
+def current_state():
+    import tomllib
+
+    data = tomllib.loads(CONFIG.read_text())
+    return data
+
+
+def provider_of(cfg: dict) -> str:
+    return cfg.get("model_provider") or "openai"
+
+
+def sessions_report() -> dict:
+    if not STATE_DB.exists():
+        return {}
+    con = sqlite3.connect(STATE_DB.resolve().as_uri() + "?mode=ro", uri=True)
+    try:
+        return dict(con.execute("SELECT model_provider, COUNT(*) FROM threads GROUP BY 1"))
+    finally:
+        con.close()
+
+
+def cmd_status(_args) -> int:
+    cfg = current_state()
+    prov = provider_of(cfg)
+    print(f"config        {CONFIG}")
+    print(f"model         {cfg.get('model')}  ·  provider {prov}")
+    if prov == "krillcode":
+        base = (cfg.get("model_providers", {}).get("krillcode") or {}).get("base_url")
+        print(f"base_url      {base}")
+    print(f"key (krill)   {'present' if read_key(OPENCODE_AUTH, 'krillcode') else 'MISSING'}")
+    counts = sessions_report()
+    print("sessions      " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())) if counts else "sessions      -")
+    busy = active_writers()
+    print(f"open sessions {len(busy)}" + ("  (run: codex-switch retag after closing them)" if busy else ""))
+    print("repair removes incompatible encrypted reasoning; it does not convert ciphertext.")
+    return 0
+
+
+def cmd_switch(args) -> int:
+    require_idle()
+    if args.no_retag:
+        raise ValueError('--no-retag is unsafe for cross-channel history; use safe repair instead')
+    if args.test:
+        raise ValueError('--test is disabled: this command makes no network smoke-test calls')
+    mode = args.channel
+    cfg = current_state()
+    target = PROVIDER_ID[mode]
+    if mode == 'krillcode':
+        url = args.url or (cfg.get('model_providers', {}).get('krillcode') or {}).get('base_url') or KRILL_URL
+        model = args.model or KRILL_MODEL
+        if not NODE:
+            raise ValueError('Node.js unavailable; set CODEX_SWITCH_NODE or install node on PATH')
+        # The existing runtime command validates availability without reading its
+        # stdout (the credential) into this process or printing it.
+        checked = subprocess.run([NODE] + AUTH_ARGS, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, timeout=15)
+        if checked.returncode:
+            raise ValueError('Krillcode key missing in OpenCode authentication')
+    else:
+        url, model = '', args.model or OFFICIAL_MODEL
+    previous_text = CONFIG.read_text()
+    text = build_config(mode, model, url, previous_text)
+    tomllib.loads(text)  # Validate in memory before backups, repair, or commit.
+    print(f'-> {mode} (model {model}, provider {target})', flush=True)
+    def commit_config():
+        require_idle()
+        if CONFIG.read_text() != previous_text:
+            raise RuntimeError('config changed concurrently; batch not committed')
+        try:
+            write_config(text)
+        except BaseException:
+            if CONFIG.read_text() != previous_text:
+                write_config(previous_text)
+            raise
+
+    repair_sessions(target, args.dry_run, commit_callback=commit_config)
+    if args.dry_run:
+        print('dry-run: config unchanged; safe repair preview only')
+        return 0
+    print('done. restart Codex to pick up the provider. Backups retained above.')
+    return 0
+
+
+def cmd_retag(args) -> int:
+    target = args.provider or provider_of(current_state())
+    repair_sessions(target, args.dry_run, getattr(args, 'session_id', None))
+    return 0
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        prog="codex-switch", description=__doc__.splitlines()[0],
+        epilog="Cross-channel repair removes incompatible encrypted reasoning; "
+               "it does not convert ciphertext. No inference is requested.")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("status", help="show current channel, sessions, key state")
+
+    for name in ("official", "krillcode"):
+        sp = sub.add_parser(name, help=f"switch to {name}")
+        sp.set_defaults(channel=name)
+        sp.add_argument("--model", help="override model id")
+        sp.add_argument("--url", help="override base_url (krillcode only)")
+        sp.add_argument("--no-retag", action="store_true", help="deprecated unsafe option (rejected)")
+        sp.add_argument("--force", action="store_true", help="compatibility only; never bypass writer locks")
+        sp.add_argument("--dry-run", action="store_true", help="preview safe repair, change nothing")
+        sp.add_argument("--test", action="store_true", help="disabled network smoke test (rejected)")
+
+    for name in ('retag', 'repair-index', 'repair-session'):
+        rp = sub.add_parser(name, help='safe cleanup, provider migration and native index rebuild')
+        if name == 'repair-session':
+            rp.add_argument('session_id', help='session UUID to repair')
+        rp.add_argument('--provider', choices=ALL_PROVIDERS, help='default: current config')
+        rp.add_argument('--force', action='store_true', help='compatibility only; cannot bypass writer locks')
+        rp.add_argument('--dry-run', action='store_true')
+
+    args = p.parse_args()
+    try:
+        if args.cmd == "status":
+            return cmd_status(args)
+        if args.cmd in ("retag", "repair-index", "repair-session"):
+            return cmd_retag(args)
+        return cmd_switch(args)
+    except KeyboardInterrupt:
+        print("! interrupted; any backup above is retained", file=sys.stderr)
+        return 130
+    except Exception as exc:
+        print(f"! {exc}; any backup above is retained", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
