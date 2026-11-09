@@ -35,6 +35,21 @@ def database(path):
 
 
 class OfflineTests(unittest.TestCase):
+    def test_inaccessible_system_ssh_agent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            proc = Path(directory) / '123'
+            proc.mkdir()
+            (proc / 'comm').write_text('ssh-agent\n')
+            (proc / 'cmdline').write_bytes(b'/usr/bin/ssh-agent\0-D\0')
+            with mock.patch.object(repair, '_inspect_process', side_effect=PermissionError), mock.patch.object(repair.time, 'sleep'):
+                self.assertEqual(repair._inspect_process_retry(proc, Path('/fixture'), (1, 2)), [])
+                (proc / 'cmdline').write_bytes(b'/tmp/ssh-agent\0')
+                with self.assertRaises(repair.RepairError):
+                    repair._inspect_process_retry(proc, Path('/fixture'), (1, 2))
+                (proc / 'comm').write_text('codex\n')
+                with self.assertRaises(repair.RepairError):
+                    repair._inspect_process_retry(proc, Path('/fixture'), (1, 2))
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

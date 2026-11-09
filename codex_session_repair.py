@@ -131,8 +131,8 @@ def _inspect_process_retry(proc, path, identity):
             if attempt < 2:
                 time.sleep(0.02)
                 continue
-            # Preserve the existing infrastructure exceptions, never add a
-            # process-name exception for an inaccessible temporary process.
+            # ssh-agent disables process inspection to protect private keys.
+            # Require both its process name and system executable argv.
             comm = ''
             try:
                 comm = (proc / 'comm').read_text().strip()
@@ -142,7 +142,16 @@ def _inspect_process_retry(proc, path, identity):
                 pass
             if not proc.exists():
                 return []
-            _require(comm in {'systemd', '(sd-pam)', 'sshd', 'sftp-server'},
+            system_agent = False
+            if comm == 'ssh-agent':
+                try:
+                    argv0 = (proc / 'cmdline').read_bytes().split(b'\0', 1)[0]
+                    system_agent = argv0 in (b'/usr/bin/ssh-agent', b'/bin/ssh-agent')
+                except (FileNotFoundError, ProcessLookupError):
+                    return []
+                except PermissionError:
+                    pass
+            _require(system_agent or comm in {'systemd', '(sd-pam)', 'sshd', 'sftp-server'},
                      f'Cannot inspect PID {proc.name} ({comm}) after bounded retry')
             return []
 
@@ -151,7 +160,7 @@ def check_writers(path):
     """Inspect local user FDs; return no value or raise ActiveWriterError.
 
     Linux non-dumpable infrastructure processes cannot expose their FDs; only
-    the known systemd/sshd helpers are exempted. An inaccessible Codex or other
+    known systemd/sshd helpers and system ssh-agent are exempted. An inaccessible Codex or other
     same-user process fails closed. No command lines/environments are read.
     """
     path = Path(path).resolve()
