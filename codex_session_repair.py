@@ -476,6 +476,7 @@ def _validate_native_append(source, replayed, session_id, provider):
     _require(suffix.endswith(b'\n'), 'Incomplete native settings append')
     settings_keys = {
         'model', 'model_provider_id', 'approval_policy', 'approvals_reviewer',
+        'requested_approvals_reviewer',
         'permission_profile', 'active_permission_profile', 'cwd', 'runtime_workspace_roots',
         'collaboration_mode', 'disabled_plugin_ids', 'reasoning_effort', 'effort',
         'service_tier', 'personality', 'sandbox_policy', 'multi_agent_mode',
@@ -526,6 +527,9 @@ def _validate_native_append(source, replayed, session_id, provider):
         _require(isinstance(settings, dict) and set(settings) <= settings_keys and
                  settings.get('model_provider_id') == provider and provider in MANAGED,
                  'Unexpected settings keys or native provider')
+        reviewer = settings.get('requested_approvals_reviewer')
+        _require(reviewer is None or isinstance(reviewer, str),
+                 'Unexpected requested approvals reviewer value')
         validate_metadata(settings)
         count += 1
     return count

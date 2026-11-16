@@ -35,6 +35,33 @@ def database(path):
 
 
 class OfflineTests(unittest.TestCase):
+    def test_native_requested_approvals_reviewer(self):
+        sid = str(uuid.UUID(int=1))
+        source = (json.dumps({'ordinal': 0, 'type': 'session_meta',
+                             'payload': {'id': sid}}) + '\n').encode()
+        settings = {'model_provider_id': 'openai',
+                    'requested_approvals_reviewer': 'user'}
+
+        def appended():
+            return source + (json.dumps({
+                'timestamp': '2026-01-01T00:00:00Z', 'ordinal': 1,
+                'type': 'event_msg', 'payload': {
+                    'type': 'thread_settings_applied', 'thread_id': sid,
+                    'thread_settings': settings}}) + '\n').encode()
+
+        self.assertEqual(repair._validate_native_append(source, appended(), sid, 'openai'), 1)
+        settings['requested_approvals_reviewer'] = {'messages': []}
+        with self.assertRaises(repair.RepairError):
+            repair._validate_native_append(source, appended(), sid, 'openai')
+        settings['requested_approvals_reviewer'] = 'user'
+        settings['model_provider_id'] = 'krillcode'
+        with self.assertRaises(repair.RepairError):
+            repair._validate_native_append(source, appended(), sid, 'openai')
+        settings['model_provider_id'] = 'openai'
+        settings['unknown_setting'] = True
+        with self.assertRaises(repair.RepairError):
+            repair._validate_native_append(source, appended(), sid, 'openai')
+
     def test_inaccessible_system_ssh_agent(self):
         with tempfile.TemporaryDirectory() as directory:
             proc = Path(directory) / '123'
