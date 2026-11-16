@@ -50,6 +50,13 @@ class OfflineTests(unittest.TestCase):
                     'thread_settings': settings}}) + '\n').encode()
 
         self.assertEqual(repair._validate_native_append(source, appended(), sid, 'openai'), 1)
+        for value in (None, 'none', 'auto', 'concise', 'detailed'):
+            settings['reasoning_summary'] = value
+            self.assertEqual(repair._validate_native_append(source, appended(), sid, 'openai'), 1)
+        settings['reasoning_summary'] = {'messages': []}
+        with self.assertRaises(repair.RepairError):
+            repair._validate_native_append(source, appended(), sid, 'openai')
+        settings['reasoning_summary'] = 'none'
         settings['requested_approvals_reviewer'] = {'messages': []}
         with self.assertRaises(repair.RepairError):
             repair._validate_native_append(source, appended(), sid, 'openai')

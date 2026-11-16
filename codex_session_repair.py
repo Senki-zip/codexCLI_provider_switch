@@ -479,6 +479,7 @@ def _validate_native_append(source, replayed, session_id, provider):
         'requested_approvals_reviewer',
         'permission_profile', 'active_permission_profile', 'cwd', 'runtime_workspace_roots',
         'collaboration_mode', 'disabled_plugin_ids', 'reasoning_effort', 'effort',
+        'reasoning_summary',
         'service_tier', 'personality', 'sandbox_policy', 'multi_agent_mode',
     }
     forbidden_keys = {'encrypted_content', 'turn_id', 'root_turn_id', 'item', 'items',
@@ -540,9 +541,15 @@ def _validate_native_append(source, replayed, session_id, provider):
                  payload['type'] == 'thread_settings_applied' and payload['thread_id'] == session_id,
                  'Native append is not this thread settings event')
         settings = payload['thread_settings']
-        _require(isinstance(settings, dict) and set(settings) <= settings_keys and
-                 settings.get('model_provider_id') == provider and provider in MANAGED,
-                 'Unexpected settings keys or native provider')
+        _require(isinstance(settings, dict), 'Native settings must be an object')
+        _require(set(settings) <= settings_keys,
+                 'Unexpected native settings keys: ' + ', '.join(sorted(set(settings) - settings_keys)))
+        _require(settings.get('model_provider_id') == provider and provider in MANAGED,
+                 'Native settings provider does not match target provider')
+        summary = settings.get('reasoning_summary')
+        _require(summary is None or (isinstance(summary, str) and
+                 summary in {'none', 'auto', 'concise', 'detailed'}),
+                 'Unexpected reasoning summary setting')
         reviewer = settings.get('requested_approvals_reviewer')
         _require(reviewer is None or isinstance(reviewer, str),
                  'Unexpected requested approvals reviewer value')
