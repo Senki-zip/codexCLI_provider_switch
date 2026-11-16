@@ -488,6 +488,20 @@ def _validate_native_append(source, replayed, session_id, provider):
                        'custom_tool_call', 'custom_tool_call_output', 'local_shell_call',
                        'web_search_call', 'task_started', 'task_complete', 'turn_started',
                        'turn_complete', 'item_completed'}
+    existing_instructions = set()
+    for line in source.splitlines():
+        record = json.loads(line)
+        payload = record.get('payload', {})
+        if record.get('type') == 'turn_context':
+            settings = payload
+        elif (record.get('type') == 'event_msg' and
+              payload.get('type') == 'thread_settings_applied'):
+            settings = payload.get('thread_settings', {})
+        else:
+            continue
+        instruction = settings.get('collaboration_mode', {}).get('settings', {}).get('developer_instructions') if isinstance(settings.get('collaboration_mode'), dict) else None
+        if isinstance(instruction, str):
+            existing_instructions.add(instruction)
 
     def validate_metadata(value):
         if isinstance(value, dict):
@@ -499,7 +513,9 @@ def _validate_native_append(source, replayed, session_id, provider):
                 _require(value['model_provider_id'] == provider and provider in MANAGED,
                          'Native append has wrong provider')
             if 'developer_instructions' in value:
-                _require(value['developer_instructions'] is None,
+                _require(value['developer_instructions'] is None or
+                         (isinstance(value['developer_instructions'], str) and
+                          value['developer_instructions'] in existing_instructions),
                          'Native append introduces developer instructions')
             for child in value.values():
                 validate_metadata(child)

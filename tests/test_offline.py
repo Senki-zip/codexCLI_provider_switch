@@ -61,6 +61,13 @@ class OfflineTests(unittest.TestCase):
         settings['unknown_setting'] = True
         with self.assertRaises(repair.RepairError):
             repair._validate_native_append(source, appended(), sid, 'openai')
+        del settings['unknown_setting']
+        settings['collaboration_mode'] = {'settings': {'developer_instructions': 'synthetic existing instruction'}}
+        with self.assertRaises(repair.RepairError):
+            repair._validate_native_append(source, appended(), sid, 'openai')
+        source = (json.dumps({'ordinal': 0, 'type': 'turn_context',
+                             'payload': {'collaboration_mode': settings['collaboration_mode']}}) + '\n').encode()
+        self.assertEqual(repair._validate_native_append(source, appended(), sid, 'openai'), 1)
 
     def test_inaccessible_system_ssh_agent(self):
         with tempfile.TemporaryDirectory() as directory:
